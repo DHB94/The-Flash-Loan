@@ -164,10 +164,18 @@ export class ArbitrageScanner {
             };
             this.wsProvider!.once("block", () => { clearTimeout(t); resolve(); });
           });
-          this.wsProvider.websocket.onerror = (event: unknown) => {
-            logWarn("WebSocket error — HTTP polling fallback remains available after restart", {
+          const originalOnError = this.wsProvider.websocket.onerror;
+          this.wsProvider.websocket.onerror = async (event: unknown) => {
+            if (originalOnError) {
+              try { originalOnError.call(this.wsProvider!.websocket, event); } catch {}
+            }
+            if (!this.wsProvider) return;
+            logWarn("WebSocket error — falling back to HTTP polling", {
               err: event instanceof Error ? event.message : String(event),
             });
+            try { await this.wsProvider.destroy(); } catch {}
+            this.wsProvider = null;
+            this._startPolling();
           };
           this.wsProvider.on("block", (blockNumber: number) => {
             if (!this.running) return;

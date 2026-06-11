@@ -35,6 +35,7 @@ import {
   PRICE_ORACLE_ABI,
 } from "./config";
 import { logInfo, logWarn, logError, logDebug } from "./logger";
+import { isHttpRpcUrl, isWebSocketRpcUrl, maskRpcUrl } from "./rpc";
 import { NonceManager }                          from "./nonce-manager";
 import { ChainlinkPriceFeed, FEEDS }             from "./price-feed";
 import { writeOpportunity, readTodayLog, OpportunityRecord } from "./opportunity-log";
@@ -143,6 +144,10 @@ export class ScanLoop {
   private sessionProfit = 0;
 
   constructor() {
+    if (!isHttpRpcUrl(ENV.POLYGON_RPC_URL)) {
+      throw new Error("POLYGON_RPC_URL must be an http:// or https:// JSON-RPC endpoint");
+    }
+
     this.http       = new JsonRpcProvider(ENV.POLYGON_RPC_URL);
     this.qsRouter   = new Contract(QUICKSWAP_ROUTER,  ROUTER_ABI,  this.http);
     this.ssRouter   = new Contract(SUSHISWAP_ROUTER,  ROUTER_ABI,  this.http);
@@ -177,7 +182,7 @@ export class ScanLoop {
   async start(): Promise<void> {
     this.running = true;
     logInfo("ScanLoop starting", {
-      rpc:          ENV.POLYGON_RPC_URL.replace(/\/v2\/.+/, "/v2/***"),
+      rpc:          maskRpcUrl(ENV.POLYGON_RPC_URL),
       spreadSource: this.spreadSource,
       minProfitUsd: MIN_PROFIT_USD,
       maxGasGwei:   MAX_GAS_GWEI,
@@ -191,18 +196,33 @@ export class ScanLoop {
     );
 
     if (ENV.POLYGON_WS_URL) {
-      try {
-        this.ws = new WebSocketProvider(ENV.POLYGON_WS_URL);
-        await new Promise<void>((resolve, reject) => {
-          const t = setTimeout(() => reject(new Error("WS timeout")), 8_000);
-          this.ws!.once("block", () => { clearTimeout(t); resolve(); });
+      if (!isWebSocketRpcUrl(ENV.POLYGON_WS_URL)) {
+        logWarn("Ignoring POLYGON_WS_URL because it is not a ws:// or wss:// endpoint", {
+          wsUrl: maskRpcUrl(ENV.POLYGON_WS_URL),
         });
-        this.ws.on("block", (n: number) => this._onBlock(n));
-        logInfo("WebSocket block subscription active");
-        return;
-      } catch (err) {
-        logWarn("WebSocket failed — HTTP polling fallback", { err: String(err) });
-        if (this.ws) { try { await this.ws.destroy(); } catch {} this.ws = null; }
+      } else {
+        try {
+          this.ws = new WebSocketProvider(ENV.POLYGON_WS_URL);
+          await new Promise<void>((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error("WS timeout")), 8_000);
+            this.ws!.websocket.onerror = (event: unknown) => {
+              clearTimeout(t);
+              reject(event instanceof Error ? event : new Error(`WebSocket error: ${String(event)}`));
+            };
+            this.ws!.once("block", () => { clearTimeout(t); resolve(); });
+          });
+          this.ws.websocket.onerror = (event: unknown) => {
+            logWarn("WebSocket error — HTTP polling fallback remains available after restart", {
+              err: event instanceof Error ? event.message : String(event),
+            });
+          };
+          this.ws.on("block", (n: number) => this._onBlock(n));
+          logInfo("WebSocket block subscription active", { wsUrl: maskRpcUrl(ENV.POLYGON_WS_URL) });
+          return;
+        } catch (err) {
+          logWarn("WebSocket failed — HTTP polling fallback", { err: String(err) });
+          if (this.ws) { try { await this.ws.destroy(); } catch {} this.ws = null; }
+        }
       }
     }
     this._pollLoop();
